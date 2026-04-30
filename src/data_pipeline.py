@@ -5,13 +5,14 @@ from pathlib import Path
 
 # Permite importar config desde cualquier carpeta
 sys.path.append(str(Path(__file__).parent))
-from config import DATA_RAW, DATA_PROCESSED, TARGET_COL, CUSTOMER_ID_COL
+from config import (DATA_RAW, DATA_PROCESSED, TARGET_COL, CUSTOMER_ID_COL, RANDOM_STATE, SAMPLE_SIZE)
 
 
-def load_and_engineer_features():
+def load_and_engineer_features(sample_size=None):
     """
     Carga el dataset AmEx y construye features agregadas a nivel cliente.
     Soporta tanto Parquet como CSV.
+    sample_size: En caso de especificarse, realiza un sample aleatorio de N clientes para testeo.
     """
     print("Cargando datos...")
 
@@ -37,6 +38,16 @@ def load_and_engineer_features():
     labels_path = DATA_RAW / "train_labels.csv"
     labels = pd.read_csv(labels_path)
     print(f"  Labels cargados: {len(labels):,} clientes únicos")
+
+    if sample_size:
+        np.random.seed(RANDOM_STATE)
+        unique_customers = labels[CUSTOMER_ID_COL].unique()
+        n_sample = min(sample_size, len(unique_customers))
+        sampled_ids = np.random.choice(unique_customers, n_sample, replace=False)
+        labels = labels[labels[CUSTOMER_ID_COL].isin(sampled_ids)]
+        train = train[train[CUSTOMER_ID_COL].isin(sampled_ids)]
+        print(f"  ⚡ Sampled to {len(sampled_ids):,} customers for testing")
+
 
     # Identificar columnas de features (excluir ID, target, fecha)
     exclude_cols = [CUSTOMER_ID_COL, TARGET_COL, "S_2"]
@@ -100,5 +111,5 @@ def load_and_engineer_features():
 
 
 if __name__ == "__main__":
-    X, y = load_and_engineer_features()
+    X, y = load_and_engineer_features(sample_size=SAMPLE_SIZE)
     print(f"\nListo. X: {X.shape}, y: {y.shape}")
