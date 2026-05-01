@@ -1,23 +1,29 @@
+"""
+Crash-resistant CatBoost training with Optuna.
+"""
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
+import os
+import gc
 import mlflow
 import mlflow.lightgbm
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import optuna
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+#import matplotlib
+#matplotlib.use("Agg")
+from optuna.storages import RDBStorage
+#import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, average_precision_score
 from mlflow.models.signature import infer_signature
 
 from config import (MLFLOW_TRACKING_URI, EXPERIMENT_NAME, RANDOM_STATE,
                     N_SPLITS, N_TRIALS, DATA_PROCESSED, TARGET_COL,
-                    CUSTOMER_ID_COL)
+                    CUSTOMER_ID_COL, OPTUNA_STORAGE_URI)
 from metrics import amex_metric, amex_metric_lgbm
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -49,11 +55,12 @@ def objective(trial, X, y):
         "n_jobs": -1,
     }
 
-    with mlflow.start_run(run_name=f"lgbm_trial_{trial.number:03d}",
-                          nested=True):
+    with mlflow.start_run(run_name=f"lgbm_trial_{trial.number:03d}"):
         mlflow.set_tags({
             "trial_number": str(trial.number),
             "model_family": "lightgbm",
+            "stage": "hyperparameter_search",
+            "study_name": "lgbm_amex_v1",
         })
         mlflow.log_params(params)
 
@@ -81,6 +88,10 @@ def objective(trial, X, y):
                 X_val, num_iteration=model.best_iteration
             )
 
+            # Memory freeing
+            del X_train, X_val, y_train, y_val, dtrain, dval, model
+            gc.collect()
+
         oof_m = amex_metric(y.values, oof_preds)
         oof_auc = roc_auc_score(y, oof_preds)
         oof_pr = average_precision_score(y, oof_preds)
@@ -91,63 +102,82 @@ def objective(trial, X, y):
             "oof_pr_auc": oof_pr,
         })
 
+        #Freeing memory at the end of trial
+        del oof_preds
+        gc.collect()
+
     return oof_m
 
 
-def train_lgbm_with_optuna():
+def train_lgbm_resumable():
+    """Resume-from-anywhere training."""
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
-
-    print("Cargando dataset...")
+    
+    print("Loading dataset...")
     X, y = load_processed_data()
     print(f"Shape: {X.shape}")
 
-    with mlflow.start_run(run_name="lgbm_optuna_search") as parent_run:
+    # Persistent Optuna storage 
+    storage = RDBStorage(url=OPTUNA_STORAGE_URI)
+    
+    study = optuna.create_study(
+        study_name="lgbm_amex_v1",
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+        storage=storage,
+        load_if_exists=True,  # ← KEY: resumes if study exists
+    )
+    
+    # Progress check
+    n_completed = len([t for t in study.trials 
+                       if t.state == optuna.trial.TrialState.COMPLETE])
+    n_remaining = N_TRIALS - n_completed
+    
+    print(f"\nStudy status:")
+    print(f"  Completed trials: {n_completed} / {N_TRIALS}")
+    print(f"  Remaining: {n_remaining}")
+    
+    if n_completed > 0:
+        print(f"  Best so far: {study.best_value:.4f}")
+        print(f"  Resuming...\n")
+    else:
+        print(f"  Starting fresh\n")
+    
+    if n_remaining <= 0:
+        print("Study already complete!")
+        return finalize_champion_model(study, X, y)
+    
+    # Run only the remaining trials
+    study.optimize(
+        lambda t: objective(t, X, y),
+        n_trials=n_remaining,
+        show_progress_bar=True,
+        gc_after_trial=True,  # extra memory cleanup
+    )
+    
+    return finalize_champion_model(study, X, y)
+
+
+def finalize_champion_model(study, X, y):
+    """After all trials complete, train and register the best model."""
+    print("\n" + "="*60)
+    print("Finalizing champion LightGBM model")
+    print("="*60)
+    
+    with mlflow.start_run(run_name="lgbm_champion_final") as run:
         mlflow.set_tags({
             "model_family": "lightgbm",
-            "stage": "hyperparameter_search",
-            "optimizer": "optuna",
-            "n_trials": str(N_TRIALS),
+            "stage": "champion_final",
         })
-        mlflow.log_params({
-            "n_trials": N_TRIALS,
-            "n_splits": N_SPLITS,
-            "optimization_metric": "amex_m_score",
-        })
-
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
-            study_name="lgbm_amex",
-        )
-        study.optimize(
-            lambda t: objective(t, X, y),
-            n_trials=N_TRIALS,
-            show_progress_bar=True,
-        )
-
-        best_trial = study.best_trial
-        mlflow.log_params({f"best_{k}": v for k, v in best_trial.params.items()})
+        mlflow.log_params({f"best_{k}": v for k, v in study.best_params.items()})
         mlflow.log_metrics({
-            "best_oof_amex_m_score": best_trial.value,
+            "best_oof_amex_m_score": study.best_value,
             "n_completed_trials": len(study.trials),
         })
 
-        # Visualizaciones de Optuna
-        try:
-            fig1 = optuna.visualization.matplotlib.plot_param_importances(study)
-            mlflow.log_figure(fig1.figure, "artifacts/optuna_importance.png")
-            plt.close()
-
-            fig2 = optuna.visualization.matplotlib.plot_optimization_history(study)
-            mlflow.log_figure(fig2.figure, "artifacts/optuna_history.png")
-            plt.close()
-        except Exception as e:
-            print(f"Warning: visualizaciones Optuna fallaron: {e}")
-
-        # Reentrenar mejor modelo
-        print("\nReentrenando mejor modelo en dataset completo...")
-        best_params = best_trial.params.copy()
+        # Retrain on full data
+        best_params = study.best_params.copy()
         best_params.update({
             "objective": "binary", "metric": "None",
             "verbosity": -1, "random_state": RANDOM_STATE, "n_jobs": -1,
@@ -166,9 +196,10 @@ def train_lgbm_with_optuna():
             input_example=X.head(5),
         )
 
-        print(f"\n✅ Mejor M Score: {best_trial.value:.4f}")
-        return parent_run.info.run_id
+        print(f"\nBest M Score: {study.best_value:.4f}")
+        print(f"Champion run ID: {run.info.run_id}")
+        return run.info.run_id
 
 
 if __name__ == "__main__":
-    train_lgbm_with_optuna()
+    train_lgbm_resumable()
