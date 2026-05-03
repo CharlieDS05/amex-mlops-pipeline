@@ -1,99 +1,205 @@
 """
-Re-evaluate all trained models with the corrected metric.
+Re-evaluate champion models with proper cross-validation.
+Uses the best hyperparameters found by Optuna and runs fresh 3-fold CV
+to get unbiased OOF (out-of-fold) M Scores with the corrected metric.
 """
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
+import gc
+import optuna
+from optuna.storages import RDBStorage
 import mlflow
-import mlflow.lightgbm
-import mlflow.xgboost
-import mlflow.catboost
+import lightgbm as lgb
+import xgboost as xgb
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
-from config import (MLFLOW_TRACKING_URI, DATA_PROCESSED, TARGET_COL,
-                    CUSTOMER_ID_COL, RANDOM_STATE, N_SPLITS)
-from metrics import amex_metric
+from config import (MLFLOW_TRACKING_URI, EXPERIMENT_NAME, DATA_PROCESSED,
+                    TARGET_COL, CUSTOMER_ID_COL, RANDOM_STATE, N_SPLITS,
+                    OPTUNA_STORAGE_URI)
+from metrics import amex_metric, amex_metric_lgbm
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def get_best_params(study_name):
+    """Retrieve best hyperparameters from a completed Optuna study."""
+    storage = RDBStorage(url=OPTUNA_STORAGE_URI)
+    study = optuna.load_study(study_name=study_name, storage=storage)
+    return study.best_params
+
+
+def evaluate_lgbm_oof(X, y, params):
+    """Run 3-fold CV with given LightGBM params, return OOF predictions."""
+    full_params = {
+        "objective": "binary", "metric": "None", "verbosity": -1,
+        "boosting_type": "gbdt", "random_state": RANDOM_STATE, "n_jobs": -1,
+        **params,
+    }
+    n_estimators = full_params.pop("n_estimators")
+    
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
+                         random_state=RANDOM_STATE)
+    oof_preds = np.zeros(len(y))
+    
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        print(f"    Fold {fold + 1}/{N_SPLITS}...")
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        dtrain = lgb.Dataset(X_train, label=y_train)
+        dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+        
+        model = lgb.train(
+            full_params, dtrain,
+            num_boost_round=n_estimators,
+            valid_sets=[dval], feval=amex_metric_lgbm,
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False),
+                       lgb.log_evaluation(period=-1)],
+        )
+        oof_preds[val_idx] = model.predict(X_val, num_iteration=model.best_iteration)
+        
+        del X_train, X_val, y_train, y_val, dtrain, dval, model
+        gc.collect()
+    
+    return oof_preds
+
+
+def evaluate_xgb_oof(X, y, params):
+    """Run 3-fold CV with given XGBoost params, return OOF predictions."""
+    full_params = {
+        "objective": "binary:logistic", "eval_metric": "auc",
+        "tree_method": "hist", "random_state": RANDOM_STATE, "n_jobs": -1,
+        **params,
+    }
+    
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
+                         random_state=RANDOM_STATE)
+    oof_preds = np.zeros(len(y))
+    
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        print(f"    Fold {fold + 1}/{N_SPLITS}...")
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        model = xgb.XGBClassifier(**full_params, early_stopping_rounds=50)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        oof_preds[val_idx] = model.predict_proba(X_val)[:, 1]
+        
+        del X_train, X_val, y_train, y_val, model
+        gc.collect()
+    
+    return oof_preds
+
+
+def evaluate_catboost_oof(X, y, params):
+    """Run 3-fold CV with given CatBoost params, return OOF predictions."""
+    from catboost import CatBoostClassifier
+    
+    full_params = {
+        "random_seed": RANDOM_STATE, "verbose": False,
+        "loss_function": "Logloss", "eval_metric": "AUC",
+        "task_type": "CPU", "thread_count": -1,
+        **params,
+    }
+    
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
+                         random_state=RANDOM_STATE)
+    oof_preds = np.zeros(len(y))
+    
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        print(f"    Fold {fold + 1}/{N_SPLITS}...")
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        model = CatBoostClassifier(**full_params)
+        model.fit(X_train, y_train, eval_set=(X_val, y_val),
+                  early_stopping_rounds=50, verbose=False)
+        oof_preds[val_idx] = model.predict_proba(X_val)[:, 1]
+        
+        del X_train, X_val, y_train, y_val, model
+        gc.collect()
+    
+    return oof_preds
 
 
 def reevaluate_all_models():
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     
-    # Load data
     df = pd.read_parquet(DATA_PROCESSED / "train_features.parquet")
     X = df.drop(columns=[CUSTOMER_ID_COL, TARGET_COL])
     y = df[TARGET_COL]
-    print(f"Data loaded: {X.shape}")
+    print(f"Data loaded: {X.shape}\n")
     
-    # Load each champion model and evaluate
     results = {}
     
     model_configs = [
-        ("lightgbm", "amex-lgbm-champion", mlflow.lightgbm),
-        ("xgboost", "amex-xgboost-champion", mlflow.xgboost),
-        ("catboost", "amex-catboost-champion", mlflow.catboost),
+        ("lightgbm", "lgbm_amex_v1", evaluate_lgbm_oof),
+        ("xgboost", "xgb_amex_v1", evaluate_xgb_oof),
+        ("catboost", "catboost_amex_v1", evaluate_catboost_oof),
     ]
     
-    for family, model_name, mlflow_module in model_configs:
+    for family, study_name, eval_func in model_configs:
         try:
-            print(f"\n{'='*60}")
-            print(f"Evaluating {family}...")
+            print(f"{'='*60}")
+            print(f"Re-evaluating {family} with proper 3-fold CV...")
             print('='*60)
             
-            # Get latest version
-            client = mlflow.tracking.MlflowClient()
-            versions = client.search_model_versions(f"name='{model_name}'")
-            if not versions:
-                print(f"  No registered versions for {model_name}")
-                continue
+            best_params = get_best_params(study_name)
+            print(f"  Best hyperparameters loaded from Optuna study.")
             
-            latest = max(versions, key=lambda v: int(v.version))
-            model_uri = f"models:/{model_name}/{latest.version}"
+            oof_preds = eval_func(X, y, best_params)
             
-            print(f"  Loading {model_uri}...")
-            model = mlflow_module.load_model(model_uri)
+            m_score = amex_metric(y.values, oof_preds)
+            roc_auc = roc_auc_score(y, oof_preds)
+            pr_auc = average_precision_score(y, oof_preds)
             
-            # Predict on full data
-            print(f"  Generating predictions...")
-            if family == "lightgbm":
-                preds = model.predict(X)
-            else:
-                preds = model.predict_proba(X)[:, 1]
-            
-            # Compute metrics
-            m_score = amex_metric(y.values, preds)
-            roc_auc = roc_auc_score(y, preds)
-            
-            print(f"  M Score (corrected): {m_score:.4f}")
-            print(f"  ROC-AUC: {roc_auc:.4f}")
+            print(f"\n  ✅ TRUE M Score (OOF): {m_score:.4f}")
+            print(f"  ✅ ROC-AUC (OOF): {roc_auc:.4f}")
+            print(f"  ✅ PR-AUC (OOF): {pr_auc:.4f}")
             
             results[family] = {
-                "m_score_corrected": m_score,
-                "roc_auc": roc_auc,
-                "model_version": latest.version,
+                "true_m_score_oof": m_score,
+                "roc_auc_oof": roc_auc,
+                "pr_auc_oof": pr_auc,
             }
             
+            # Log to MLflow under a new run for tracking
+            with mlflow.start_run(run_name=f"{family}_corrected_oof_eval"):
+                mlflow.set_tags({
+                    "model_family": family,
+                    "stage": "corrected_evaluation",
+                })
+                mlflow.log_metrics({
+                    "true_m_score_oof": m_score,
+                    "roc_auc_oof": roc_auc,
+                    "pr_auc_oof": pr_auc,
+                })
+            
         except Exception as e:
-            print(f"  Error evaluating {family}: {e}")
+            print(f"\n  ❌ Error evaluating {family}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
-    # Summary
     print(f"\n{'='*60}")
-    print("FINAL COMPARISON (corrected metric)")
+    print("FINAL HONEST COMPARISON (3-fold OOF, corrected metric)")
     print('='*60)
-    df_results = pd.DataFrame(results).T
-    df_results = df_results.sort_values("m_score_corrected", ascending=False)
-    print(df_results.to_string())
     
-    if not df_results.empty:
+    if results:
+        df_results = pd.DataFrame(results).T
+        df_results = df_results.sort_values("true_m_score_oof", ascending=False)
+        print(df_results.to_string())
+        
         champion = df_results.index[0]
-        print(f"\n🏆 True champion: {champion}")
-        print(f"   M Score: {df_results.iloc[0]['m_score_corrected']:.4f}")
+        print(f"\n🏆 TRUE Champion: {champion}")
+        print(f"   M Score (OOF): {df_results.iloc[0]['true_m_score_oof']:.4f}")
     
-    return df_results
+    return results
 
 
 if __name__ == "__main__":
