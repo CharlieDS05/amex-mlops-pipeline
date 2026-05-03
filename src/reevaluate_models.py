@@ -129,6 +129,7 @@ def evaluate_catboost_oof(X, y, params):
 
 def reevaluate_all_models():
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
     
     df = pd.read_parquet(DATA_PROCESSED / "train_features.parquet")
     X = df.drop(columns=[CUSTOMER_ID_COL, TARGET_COL])
@@ -139,7 +140,6 @@ def reevaluate_all_models():
     
     model_configs = [
         ("lightgbm", "lgbm_amex_v1", evaluate_lgbm_oof),
-        ("xgboost", "xgb_amex_v1", evaluate_xgb_oof),
         ("catboost", "catboost_amex_v1", evaluate_catboost_oof),
     ]
     
