@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+data/
+notebooks/
+.ipynb_checkpoints/
+.DS_Store
+mlruns_backup/
+*.tar.gz
