@@ -1,15 +1,13 @@
 """
 Re-evaluate champion models with proper cross-validation.
-Uses the best hyperparameters found by Optuna and runs fresh 3-fold CV
-to get unbiased OOF (out-of-fold) M Scores with the corrected metric.
+Uses best hyperparameters from MLflow (most reliable source) and runs
+fresh 3-fold CV to get unbiased OOF M Scores with the corrected metric.
 """
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 import gc
-import optuna
-from optuna.storages import RDBStorage
 import mlflow
 import lightgbm as lgb
 import xgboost as xgb
@@ -19,22 +17,49 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 from config import (MLFLOW_TRACKING_URI, EXPERIMENT_NAME, DATA_PROCESSED,
-                    TARGET_COL, CUSTOMER_ID_COL, RANDOM_STATE, N_SPLITS,
-                    OPTUNA_STORAGE_URI)
+                    TARGET_COL, CUSTOMER_ID_COL, RANDOM_STATE, N_SPLITS)
 from metrics import amex_metric, amex_metric_lgbm
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-
-def get_best_params(study_name):
-    """Retrieve best hyperparameters from a completed Optuna study."""
-    storage = RDBStorage(url=OPTUNA_STORAGE_URI)
-    study = optuna.load_study(study_name=study_name, storage=storage)
-    return study.best_params
+def get_best_params_from_mlflow(model_family, param_types):
+    """
+    Extract best hyperparameters from MLflow runs.
+    """
+    client = mlflow.tracking.MlflowClient()
+    exp = client.get_experiment_by_name(EXPERIMENT_NAME)
+    
+    runs = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string=(f"tags.model_family = '{model_family}' "
+                       f"AND tags.stage = 'hyperparameter_search'"),
+        order_by=["metrics.oof_amex_m_score DESC"],
+        max_results=1,
+    )
+    
+    if runs.empty:
+        return None
+    
+    best_run = runs.iloc[0]
+    print(f"  Best trial: {best_run['tags.mlflow.runName']}")
+    print(f"  Buggy metric score (training time): "
+          f"{best_run['metrics.oof_amex_m_score']:.4f}")
+    
+    # Extract and convert hyperparameters
+    params = {}
+    for col in best_run.index:
+        if col.startswith('params.'):
+            param_name = col.replace('params.', '')
+            if param_name in param_types:
+                value = best_run[col]
+                if pd.isna(value):
+                    continue
+                params[param_name] = param_types[param_name](float(value))
+    
+    return params
 
 
 def evaluate_lgbm_oof(X, y, params):
-    """Run 3-fold CV with given LightGBM params, return OOF predictions."""
+    """Run 3-fold CV with given LightGBM params."""
     full_params = {
         "objective": "binary", "metric": "None", "verbosity": -1,
         "boosting_type": "gbdt", "random_state": RANDOM_STATE, "n_jobs": -1,
@@ -70,7 +95,7 @@ def evaluate_lgbm_oof(X, y, params):
 
 
 def evaluate_xgb_oof(X, y, params):
-    """Run 3-fold CV with given XGBoost params, return OOF predictions."""
+    """Run 3-fold CV with given XGBoost params."""
     full_params = {
         "objective": "binary:logistic", "eval_metric": "auc",
         "tree_method": "hist", "random_state": RANDOM_STATE, "n_jobs": -1,
@@ -97,7 +122,7 @@ def evaluate_xgb_oof(X, y, params):
 
 
 def evaluate_catboost_oof(X, y, params):
-    """Run 3-fold CV with given CatBoost params, return OOF predictions."""
+    """Run 3-fold CV with given CatBoost params."""
     from catboost import CatBoostClassifier
     
     full_params = {
@@ -136,21 +161,45 @@ def reevaluate_all_models():
     y = df[TARGET_COL]
     print(f"Data loaded: {X.shape}\n")
     
-    results = {}
+    # Define param types per model
+    lgbm_param_types = {
+        "num_leaves": int, "max_depth": int, "n_estimators": int,
+        "min_child_samples": int,
+        "learning_rate": float, "subsample": float, "colsample_bytree": float,
+        "reg_alpha": float, "reg_lambda": float,
+    }
+    xgb_param_types = {
+        "max_depth": int, "min_child_weight": int, "n_estimators": int,
+        "eta": float, "subsample": float, "colsample_bytree": float,
+        "reg_alpha": float, "reg_lambda": float, "gamma": float,
+    }
+    catboost_param_types = {
+        "iterations": int, "depth": int, "border_count": int,
+        "learning_rate": float, "l2_leaf_reg": float,
+        "bagging_temperature": float, "random_strength": float,
+    }
     
     model_configs = [
-        ("lightgbm", "lgbm_amex_v1", evaluate_lgbm_oof),
-        ("catboost", "catboost_amex_v1", evaluate_catboost_oof),
+        ("lightgbm", evaluate_lgbm_oof, lgbm_param_types),
+        ("xgboost", evaluate_xgb_oof, xgb_param_types),
+        ("catboost", evaluate_catboost_oof, catboost_param_types),
     ]
     
-    for family, study_name, eval_func in model_configs:
+    results = {}
+    
+    for family, eval_func, param_types in model_configs:
         try:
             print(f"{'='*60}")
             print(f"Re-evaluating {family} with proper 3-fold CV...")
             print('='*60)
             
-            best_params = get_best_params(study_name)
-            print(f"  Best hyperparameters loaded from Optuna study.")
+            best_params = get_best_params_from_mlflow(family, param_types)
+            
+            if best_params is None:
+                print(f"  ⚠️  No trials found in MLflow for {family}")
+                continue
+            
+            print(f"  Hyperparameters loaded ({len(best_params)} params)")
             
             oof_preds = eval_func(X, y, best_params)
             
@@ -168,7 +217,6 @@ def reevaluate_all_models():
                 "pr_auc_oof": pr_auc,
             }
             
-            # Log to MLflow under a new run for tracking
             with mlflow.start_run(run_name=f"{family}_corrected_oof_eval"):
                 mlflow.set_tags({
                     "model_family": family,
