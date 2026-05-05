@@ -44,12 +44,14 @@ Champion model selected based on out-of-fold cross-validation with the official 
 - pytest-cov (coverage reporting)
 - GitHub Actions (continuous integration)
 
-## Architecture
+##  Architecture
+
+```
 ┌──────────────────────────────────────────────────────────┐
 │                  Training Pipeline                       │
 │  Data → Feature Engineering → Optuna HPO → MLflow Logs   │
 └──────────────────────────────────────────────────────────┘
-↓
+                            ↓
 ┌──────────────────────────────────────────────────────────┐
 │              MLflow Stack (Dockerized)                   │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐        │
@@ -57,13 +59,14 @@ Champion model selected based on out-of-fold cross-validation with the official 
 │  │  :5000   │  │ Backend  │  │ Artifact Store   │        │
 │  └──────────┘  └──────────┘  └──────────────────┘        │
 └──────────────────────────────────────────────────────────┘
-↓
+                            ↓
 ┌──────────────────────────────────────────────────────────┐
 │                  FastAPI Service                         │
 │  /predict — POST customer features → default probability │
 │  /docs — Auto-generated OpenAPI documentation            │
 │  :8000                                                   │
 └──────────────────────────────────────────────────────────┘
+```
 
 ## Quick Start
 
@@ -120,6 +123,7 @@ Tests run automatically on every push via GitHub Actions.
 
 ## Project Structure
 
+```
 amex-mlops-pipeline/
 ├── .github/workflows/      # CI/CD configuration
 ├── docker/                 # Dockerfiles
@@ -139,6 +143,7 @@ amex-mlops-pipeline/
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
+```
 
 ## Key Learnings
 
