@@ -74,6 +74,16 @@ services:
       AWS_SECRET_ACCESS_KEY: minio12345
     volumes:
       - ./mlruns:/app/mlruns
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/streamlit/Dockerfile
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    environment:
+      API_URL: http://api:8000
 
 volumes:
   postgres_data:

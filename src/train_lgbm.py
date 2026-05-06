@@ -1,5 +1,5 @@
 """
-Crash-resistant CatBoost training with Optuna.
+Crash-resistant Lightgbm training with Optuna.
 """
 import sys
 from pathlib import Path
